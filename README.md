@@ -28,6 +28,8 @@ PASS  3 passed, 0 failed
 
 Only JTAG traffic and a few kilobytes of JSON cross the network. The bitstream never leaves the machine that built it.
 
+![fpgatest demo](demo/fpgatest.mp4)
+
 ## Transport
 
 FPGA toolchains are large, licensed and Linux-only, and the board is rarely attached to the machine that has them. Two obvious ways to bridge that gap disappoint: USB/IP forwards raw USB transfers, so every JTAG shift pays a network round trip; a Linux VM with USB passthrough works but adds x86 emulation on ARM hosts.
