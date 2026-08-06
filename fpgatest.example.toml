@@ -1,0 +1,127 @@
+# fpgatest configuration -- copy to ./fpgatest.toml or ~/.config/fpgatest/fpgatest.toml
+
+[remote]
+host    = "urelg@i80i9node1.in8.itec.kit.edu"                 # SSH config alias; ProxyJump etc. all honoured
+project = "~/vivado/lab2"               # searched for .xpr / .bit / .xsa / .elf
+setup   = "source /Software/xilinx/2022.2/Vivado/2022.2/settings64.sh"
+python  = "python3"
+
+
+# ---------------------------------------------------------------------------
+# Building. Vivado runs detached on the server in its own session, so a dropped
+# SSH connection or a Ctrl-C here does not kill it -- `fpgatest build` will
+# reattach to a run already in flight.
+#
+# Staleness is decided by Vivado itself (NEEDS_REFRESH / PROGRESS on synth_1
+# and impl_1), not by guessing at file timestamps, so an up-to-date project is
+# never re-synthesised.
+# ---------------------------------------------------------------------------
+
+[build]
+enabled          = true    # build automatically when the artifacts are stale
+xpr              = ""      # "" = autodetect the newest .xpr under the project
+tcl_script       = ""      # non-project flow: run this Tcl instead of managing runs
+jobs             = 0       # 0 = use every core on the server
+simulation       = false   # run launch_simulation before synthesis
+simulation_fatal = false   # ...and stop the build if it fails
+export_xsa       = ""      # e.g. "~/labs/lab2/lab2.xsa" to re-export after impl
+poll_s           = 3
+
+
+[log]
+dir  = "~/.fpgatest/logs"  # one timestamped directory per run, plus a `latest` link
+keep = 50
+
+
+[cable]
+url          = "ftdi://ftdi:2232h/1"  # FT2232H channel A = JTAG
+frequency_hz = 10_000_000             # drop to 5 MHz if the chain scan is flaky
+# The maximum shift size advertised in the XVC handshake. Bigger means fewer
+# network round trips per bitstream -- but hw_server silently closes the cable
+# if it dislikes the value, so 2048 (what Xilinx's own reference server
+# advertises) is the safe default. Raise it and watch the "kbit per shift"
+# figure: if the cable attaches and the number goes up, keep it. fpgatest backs
+# off automatically if hw_server walks away without shifting.
+vector_bytes = 2048
+
+
+[uart]
+enabled  = true
+baud     = 115200
+port     = ""                         # "" = autodetect /dev/cu.usbserial-*B
+settle_s = 1.0
+
+
+[hw]
+base = "0x43C00000"                   # AXI-Lite base of the calculator IP
+
+
+[run]
+# auto     -> full if an application ELF exists, otherwise bit
+# pl-only  -> nothing but `fpga -file`. No ps7_init, so no FCLK: only correct
+#             if the PL is clocked by an on-board oscillator.
+# bit      -> program the PL + ps7_init (FCLK alive), no application
+# full     -> + download and start the application ELF
+mode      = "bit"
+settle_ms = 1500
+timeout_s = 900
+
+
+# ---------------------------------------------------------------------------
+# Register testbench. Runs with the CPU halted right after ps7_init, so the
+# host drives AXI directly and the result depends only on the PL. Offsets are
+# relative to [hw].base. Skipped in pl-only mode.
+#
+#   op1 @ 0x10   op2 @ 0x18   op_sel @ 0x20   result @ 0x28
+# ---------------------------------------------------------------------------
+
+[[test]]
+name = "multiply 99 x 99"
+ops = [
+  { write = 0x10, value = 99 },
+  { write = 0x18, value = 99 },
+  { write = 0x20, value = 2 },
+  { delay_ms = 5 },
+  { read = 0x28, expect = 9801 },
+]
+
+[[test]]
+name = "add 12 + 34"
+ops = [
+  { write = 0x10, value = 12 },
+  { write = 0x18, value = 34 },
+  { write = 0x20, value = 0 },
+  { delay_ms = 5 },
+  { read = 0x28, expect = 46 },
+]
+
+[[test]]
+name = "42 x 17"
+ops = [
+  { write = 0x10, value = 42 },
+  { write = 0x18, value = 17 },
+  { write = 0x20, value = 2 },
+]
+
+# Runs after the application ELF has been downloaded and started (mode = full).
+[[test]]
+name  = "app leaves 9801 latched"
+stage = "post_elf"
+ops   = [ { read = 0x28, expect = 9801 } ]
+
+
+# ---------------------------------------------------------------------------
+# UART assertions, matched as regexes against everything the board prints on
+# FT2232 channel B while the application runs. Only meaningful in mode = full.
+# ---------------------------------------------------------------------------
+
+[[test]]
+name        = "boot banner"
+uart_expect = "Calculator ready"
+timeout_s   = 15
+
+# uart_reject is the inverse: the run fails if this ever appears.
+[[test]]
+name        = "no processor exception"
+uart_reject = "Data Abort|Prefetch Abort|Undefined Instruction"
+timeout_s   = 5

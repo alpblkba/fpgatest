@@ -1,0 +1,205 @@
+# ===========================================================================
+# Lab 2 -- AXI-Lite calculator + seven-segment display, Blackboard xc7z007s
+# ===========================================================================
+#
+# THREE VALUES BELOW ARE UNVERIFIED. Confirm them before trusting a green run:
+#
+#   [hw].base        AXI-Lite base address of the calculator IP
+#   result offset    where ap_return lands (0x28 is the usual HLS layout when
+#                    op1=0x10, op2=0x18, op_sel=0x20, but check)
+#   op_sel encoding  which code means add / sub / mul
+#
+# All three are in the driver header Vitis HLS generates. On the server:
+#
+#   find ~/vivado -name 'x*_hw.h' -path '*drivers*' -exec cat {} +
+#   grep -rn 'BASEADDR' ~/vivado/lab2/*/include/xparameters.h
+#
+# A wrong offset reads back 0 and the test fails loudly, so this is safe to
+# get wrong -- it just will not tell you anything useful.
+# ===========================================================================
+
+[remote]
+host    = "urelg@i80i9node1.in8.itec.kit.edu"
+project = "~/vivado/lab2"
+
+# Vivado alone ships hw_server but not xsdb, which is a Vitis component. Source
+# Vitis when it is there (it puts vivado on PATH too) and fall back to Vivado
+# otherwise, so `doctor` can tell you which one you actually have.
+setup = """
+source /Software/xilinx/2022.2/Vivado/2022.2/settings64.sh
+if [ -f /Software/xilinx/2022.2/Vitis/2022.2/settings64.sh ]; then
+    source /Software/xilinx/2022.2/Vitis/2022.2/settings64.sh
+fi
+true
+"""
+
+python  = "python3"
+
+
+[build]
+enabled          = true
+xpr              = ""      # "" = autodetect the newest .xpr under the project
+tcl_script       = ""      # set to "scripts/build_lab2_vivado.tcl" for the Tcl flow
+jobs             = 0
+simulation       = false
+simulation_fatal = false
+export_xsa       = ""
+poll_s           = 3
+
+
+[log]
+dir  = "~/.fpgatest/logs"
+keep = 50
+
+
+[cable]
+url          = "ftdi://ftdi:2232h/1"
+frequency_hz = 10_000_000
+# Max shift size advertised in the XVC handshake. 2048 is what Xilinx's own
+# reference xvcServer reports and is the known-good value; larger means fewer
+# network round trips but hw_server may reject it by silently closing the
+# socket. fpgatest backs off automatically if that happens.
+vector_bytes = 2048
+
+
+[uart]
+enabled  = true
+baud     = 115200
+port     = ""
+settle_s = 1.0
+
+
+[hw]
+# Verified against seven_segment.hwh inside the XSA: the AXI-Lite slave is
+# mapped at 0x40000000-0x4000FFFF. It is NOT Vivado's usual 0x43C00000 -- that
+# address is unmapped here, and `mwr -force` writes to it without complaining,
+# so the only symptom was a display that stayed dark.
+base = "0x40000000"
+
+
+[run]
+mode      = "bit"          # program the PL + ps7_init. No ELF: the register
+                           # testbench drives the calculator from the host, so
+                           # the application is not in the loop at all.
+settle_ms = 1500
+timeout_s = 900
+
+
+# ---------------------------------------------------------------------------
+# Register testbench -- proves the arithmetic.
+#
+# Runs with the CPU halted straight after ps7_init. `ap_ctrl_none` means the
+# block is free-running, so writing the operands is enough; there is no
+# ap_start to pulse.
+#
+#   op1 @ 0x10   op2 @ 0x18   op_sel @ 0x20   result @ 0x28
+# ---------------------------------------------------------------------------
+
+# THERE IS NO RESULT REGISTER. The generated driver header inside the XSA
+# (drivers/seven_segment_axi_v1_0/src/xseven_segment_axi_hw.h) maps exactly
+# three registers and stops at 0x20:
+#
+#   0x10  op1     (7 bits, so 0-127)
+#   0x18  op2     (7 bits)
+#   0x20  op_sel  (2 bits)
+#
+# ap_return is never exposed on the bus -- the result goes straight to the
+# display pins. Reading 0x28 returned 0 because nothing lives there, not
+# because the arithmetic was wrong. So the register tests can only prove that
+# the AXI-Lite write path works; the arithmetic itself is provable only by
+# looking at the display, which is what the confirm checks below are for.
+#
+# All three registers are Read/Write, so reading them back is a real test of
+# the bus rather than a tautology.
+
+# --- staged tests -----------------------------------------------------------
+#
+# The three writes normally land within microseconds of each other, so the
+# display jumps 0 -> 9801 and you never see an operand arrive on its own. The
+# delays below stretch that out to human speed. WATCH THE DISPLAY while these
+# run -- the confirm prompts at the end ask what you saw.
+#
+# These double as the experiment that pins down the op_sel encoding, which was
+# never verified: with op_sel left at 0, writing op1 alone must show op1
+# itself (op1 + 0), and writing op2 after it must show the sum.
+
+[[test]]
+name = "staged: op1 first, then op2, then multiply"
+ops = [
+  { write = 0x20, value = 0 },   # add mode, so each operand is visible alone
+  { write = 0x10, value = 0 },
+  { write = 0x18, value = 0 },
+  { delay_ms = 2000 },           # display: 0
+  { write = 0x10, value = 99 },
+  { delay_ms = 2500 },           # display: 99    <- op1 alone
+  { write = 0x18, value = 99 },
+  { delay_ms = 2500 },           # display: 198   <- proves op_sel 0 = add
+  { write = 0x20, value = 2 },
+  { delay_ms = 2500 },           # display: 9801  <- multiply
+  { read = 0x10, expect = 99 },
+  { read = 0x18, expect = 99 },
+  { read = 0x20, expect = 2 },
+]
+
+[[test]]
+name = "staged: op2 first, then op1, then subtract"
+ops = [
+  { write = 0x20, value = 0 },
+  { write = 0x10, value = 0 },
+  { write = 0x18, value = 0 },
+  { delay_ms = 2000 },           # display: 0
+  { write = 0x18, value = 17 },
+  { delay_ms = 2500 },           # display: 17    <- op2 alone
+  { write = 0x10, value = 42 },
+  { delay_ms = 2500 },           # display: 59    <- 42 + 17
+  { write = 0x20, value = 1 },
+  { delay_ms = 2500 },           # display: 25 if op_sel 1 = subtract (42-17)
+  { read = 0x10, expect = 42 },
+  { read = 0x18, expect = 17 },
+]
+
+# Leave the board on the four-digit case so the display ends at 9801.
+[[test]]
+name = "AXI-Lite write path (op1=99, op2=99, op_sel=mul)"
+ops = [
+  { write = 0x10, value = 99 },
+  { write = 0x18, value = 99 },
+  { write = 0x20, value = 2 },
+  { delay_ms = 5 },
+  { read = 0x10, expect = 99 },
+  { read = 0x18, expect = 99 },
+  { read = 0x20, expect = 2 },
+]
+
+
+# ---------------------------------------------------------------------------
+# Visual checks -- prove the display.
+#
+# The register tests above cannot catch either of the two bugs that actually
+# bit this design, because both live downstream of the result register:
+#
+#   * the segment map bug (seg[0] driven from the MSB instead of SSEG_CA)
+#     mirrors every digit, swapping 2<->5 and 6<->9. The result register reads
+#     back perfectly correct while the display lies.
+#   * a missing `#pragma HLS PIPELINE II=1` gives ~35-cycle latency instead of
+#     II=1 and shows up only as visible flicker. C simulation cannot see it.
+#
+# The test values are chosen so a mirrored display is unambiguous rather than
+# plausible: 9801 mirrors to 6801, and the 5x5 case above leaves 25 -> 52.
+# ---------------------------------------------------------------------------
+
+[[test]]
+name    = "staged run showed each operand arrive"
+confirm = "Kademeli testte sirayla 0 -> 99 -> 198 -> 9801 gordun mu? (198 gorunduyse op_sel=0 toplama demektir)"
+
+[[test]]
+name    = "staged run showed op2 first and subtract"
+confirm = "Ikinci kademeli testte 0 -> 17 -> 59 -> 25 gordun mu? (25 gorunduyse op_sel=1 cikarma ve op1-op2 sirasi dogru)"
+
+[[test]]
+name    = "display shows 9801, not 6801"
+confirm = "Displayde 9801 yaziyor mu? (6801 gorurseniz segment map ayna bugu geri gelmis)"
+
+[[test]]
+name    = "display is steady"
+confirm = "Ekran sabit mi, titriyor mu? Titriyorsa PIPELINE II=1 pragmasi dusmus. Sabitse y"

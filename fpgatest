@@ -1,0 +1,1135 @@
+#!/usr/bin/env python3
+"""
+fpgatest -- one command to test a remotely-built bitstream on a locally-attached
+Blackboard, from an Apple Silicon Mac.
+
+    Mac (this machine)                          CES server (hiwi-node)
+    ------------------                          ----------------------
+    Blackboard --USB--> xvcd :LOCAL
+                          ^
+                          |  ssh -R REMOTE:127.0.0.1:LOCAL
+                          +------------------- hw_server -e "...xilinx-xvc:127.0.0.1:REMOTE"
+                                                          ^
+    UART capture <--USB-- (FT2232 ch. B)                  |
+                                                        xsdb
+    fpgatest ---------------- ssh ------------------> remote_agent.py
+
+Only JTAG transactions and a few kilobytes of JSON cross the network. The
+bitstream itself never leaves the server it was built on.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+
+def _reexec_into_venv() -> None:
+    """Hop into ./.venv automatically.
+
+    Homebrew's Python is externally managed (PEP 668), so the dependencies can
+    only live in a virtualenv. Re-executing ourselves there means `./fpgatest`
+    just works without anyone remembering to activate anything.
+
+    The "am I already inside it?" test has to be sys.prefix. A virtualenv's
+    bin/python3 is a symlink to the base interpreter, so comparing
+    realpath(sys.executable) against it always matches and the jump never
+    happens."""
+    if os.environ.get("FPGATEST_NO_REEXEC"):
+        return
+    try:
+        import pyftdi  # noqa: F401
+        return
+    except ImportError:
+        pass
+    venv = os.path.join(HERE, ".venv")
+    venv_py = os.path.join(venv, "bin", "python3")
+    if os.path.abspath(sys.prefix) == os.path.abspath(venv):
+        return  # already here, and the dependency is genuinely missing
+    if not os.path.exists(venv_py):
+        return
+    os.environ["FPGATEST_NO_REEXEC"] = "1"
+    os.execv(venv_py, [venv_py, os.path.join(HERE, "fpgatest")] + sys.argv[1:])
+
+
+_reexec_into_venv()
+
+def rquote(path: str) -> str:
+    """Quote a remote path, but leave a leading ~ for the shell to expand.
+
+    shlex.quote would wrap the whole thing in single quotes and the tilde would
+    arrive at the far end as a literal character."""
+    if path == "~":
+        return "~"
+    if path.startswith("~/"):
+        return "~/" + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+RESULT_MARKER = "##FPGATEST-RESULT##"
+REMOTE_AGENT = os.path.join(HERE, "remote_agent.py")
+REMOTE_AGENT_PATH = ".cache/fpgatest/remote_agent.py"
+
+CONFIG_NAMES = ("fpgatest.toml", ".fpgatest.toml")
+
+
+# ----------------------------------------------------------------- pretty print
+
+class C:
+    if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+        RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+        RED, GREEN, YELLOW, BLUE = "\033[31m", "\033[32m", "\033[33m", "\033[34m"
+    else:
+        RESET = BOLD = DIM = RED = GREEN = YELLOW = BLUE = ""
+
+
+def hdr(text: str) -> None:
+    print(f"\n{C.BOLD}{text}{C.RESET}")
+
+
+def ok(text: str) -> None:
+    print(f"  {C.GREEN}ok{C.RESET}    {text}")
+
+
+def bad(text: str) -> None:
+    print(f"  {C.RED}fail{C.RESET}  {text}")
+
+
+def warn(text: str) -> None:
+    print(f"  {C.YELLOW}warn{C.RESET}  {text}")
+
+
+def info(text: str) -> None:
+    print(f"  {C.DIM}·{C.RESET}     {text}")
+
+
+# ------------------------------------------------------------------------ config
+
+DEFAULTS = {
+    "remote": {"host": "hiwi-node", "project": "", "setup": "", "python": "python3"},
+    "cable": {"url": "ftdi://ftdi:2232h/1", "frequency_hz": 10_000_000,
+              "vector_bytes": 2048},
+    "uart": {"enabled": True, "baud": 115200, "port": "", "settle_s": 1.0},
+    "hw": {"base": "0x0"},
+    "run": {"mode": "auto", "settle_ms": 1500, "timeout_s": 900},
+    "build": {"enabled": True, "tcl_script": "", "xpr": "", "jobs": 0,
+              "simulation": False, "simulation_fatal": False,
+              "export_xsa": "", "poll_s": 3},
+    "log": {"dir": "~/.fpgatest/logs", "keep": 50},
+}
+
+
+def _toml_load(fh):
+    """Imported lazily so that `doctor`, `scan` and `--help` work on any
+    Python, and only config parsing needs 3.11+ (or the tomli backport)."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            sys.stderr.write(
+                "reading fpgatest.toml needs Python 3.11+ "
+                "(brew install python@3.12) or `pip install tomli`.\n")
+            raise SystemExit(2)
+    return tomllib.load(fh)
+
+
+def load_config(explicit: str | None) -> tuple[dict, str | None]:
+    path = explicit
+    if not path:
+        for d in (os.getcwd(), os.path.expanduser("~/.config/fpgatest")):
+            for name in CONFIG_NAMES:
+                cand = os.path.join(d, name)
+                if os.path.isfile(cand):
+                    path = cand
+                    break
+            if path:
+                break
+    cfg = {k: dict(v) for k, v in DEFAULTS.items()}
+    cfg["tests"] = []
+    if path:
+        with open(path, "rb") as fh:
+            loaded = _toml_load(fh)
+        for section, values in loaded.items():
+            if section == "test":
+                cfg["tests"] = values if isinstance(values, list) else [values]
+            elif isinstance(values, dict):
+                cfg.setdefault(section, {}).update(values)
+            else:
+                cfg[section] = values
+    return cfg, path
+
+
+# --------------------------------------------------------------------------- ssh
+
+@dataclass
+class Ssh:
+    host: str
+    ctl: str = field(default_factory=lambda: os.path.join(
+        tempfile.mkdtemp(prefix="fpgatest-"), "ctl"))
+    _open: bool = False
+
+    def connect(self) -> None:
+        subprocess.run(
+            ["ssh", "-M", "-S", self.ctl, "-o", "ControlPersist=120",
+             "-o", "BatchMode=yes", "-fN", self.host],
+            check=True)
+        self._open = True
+
+    def close(self) -> None:
+        if self._open:
+            subprocess.run(["ssh", "-S", self.ctl, "-O", "exit", self.host],
+                           capture_output=True)
+            self._open = False
+        shutil.rmtree(os.path.dirname(self.ctl), ignore_errors=True)
+
+    def run(self, cmd: str, stdin_data: bytes | None = None,
+            stream_stderr: bool = False, timeout: float | None = None):
+        """Run a command on the remote. With stream_stderr the agent's live
+        progress reaches the terminal while stdout is still captured."""
+        return subprocess.run(
+            ["ssh", "-S", self.ctl, self.host, cmd],
+            input=stdin_data,
+            stdout=subprocess.PIPE,
+            stderr=None if stream_stderr else subprocess.PIPE,
+            timeout=timeout)
+
+    def forward_remote(self, local_port: int) -> int:
+        """Ask the master for a reverse tunnel on a server-chosen free port.
+
+        Letting sshd pick the port matters on a shared machine: a hard-coded
+        2542 collides the moment a second person runs this."""
+        proc = subprocess.run(
+            ["ssh", "-S", self.ctl, "-O", "forward",
+             "-R", f"0:127.0.0.1:{local_port}", self.host],
+            capture_output=True, text=True)
+        text = (proc.stdout + proc.stderr).strip()
+        match = re.search(r"\d+", text)
+        if proc.returncode != 0 or not match:
+            raise RuntimeError(f"reverse tunnel failed: {text or proc.returncode}")
+        return int(match.group())
+
+
+def remote_json(proc: subprocess.CompletedProcess) -> dict:
+    for line in proc.stdout.decode(errors="replace").splitlines():
+        if line.startswith(RESULT_MARKER):
+            return json.loads(line[len(RESULT_MARKER):])
+    tail = (proc.stderr or b"").decode(errors="replace")[-3000:]
+    raise RuntimeError(
+        "agent produced no result"
+        + (f". stderr:\n{tail}" if tail else " (see the output above)"))
+
+
+# -------------------------------------------------------------------- uart capture
+
+class UartCapture:
+    def __init__(self, port: str, baud: int):
+        self.port, self.baud = port, baud
+        self.buf = bytearray()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._ser = None
+
+    @staticmethod
+    def autodetect() -> str | None:
+        ports = sorted(glob.glob("/dev/cu.usbserial-*"))
+        # Digilent/Real Digital boards put JTAG on FT2232 channel A and the
+        # UART on channel B, which macOS names with a trailing "B".
+        for p in ports:
+            if p.endswith("B"):
+                return p
+        return ports[-1] if ports else None
+
+    def start(self) -> None:
+        import serial  # pyserial
+        self._ser = serial.Serial(self.port, self.baud, timeout=0.2)
+        self._ser.reset_input_buffer()
+
+        def pump():
+            while not self._stop.is_set():
+                try:
+                    chunk = self._ser.read(4096)
+                except Exception:
+                    break
+                if chunk:
+                    self.buf += chunk
+
+        self._thread = threading.Thread(target=pump, daemon=True)
+        self._thread.start()
+
+    def text(self) -> str:
+        return self.buf.decode("utf-8", errors="replace")
+
+    def wait_for(self, pattern: str, timeout: float) -> bool:
+        rx = re.compile(pattern)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if rx.search(self.text()):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        if self._ser:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+
+
+# ------------------------------------------------------------------- run logs
+
+class RunLog:
+    """A timestamped directory on this machine holding everything about one run.
+
+    Builds happen on a server we do not control and Vivado logs get overwritten
+    by the next run, so anything we want to be able to look at afterwards has to
+    be pulled back here while we still have it."""
+
+    def __init__(self, base: str, project: str, keep: int = 50):
+        base = os.path.expanduser(base)
+        name = os.path.basename(str(project).rstrip("/")) or "run"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        self.dir = os.path.join(base, f"{stamp}-{name}")
+        os.makedirs(self.dir, exist_ok=True)
+        link = os.path.join(base, "latest")
+        try:
+            if os.path.islink(link) or os.path.exists(link):
+                os.remove(link)
+            os.symlink(self.dir, link)
+        except OSError:
+            pass
+        self._prune(base, keep)
+
+    @staticmethod
+    def _prune(base: str, keep: int) -> None:
+        try:
+            runs = sorted(d for d in os.listdir(base)
+                          if os.path.isdir(os.path.join(base, d)) and d[0].isdigit())
+        except OSError:
+            return
+        for old in runs[:max(0, len(runs) - keep)]:
+            shutil.rmtree(os.path.join(base, old), ignore_errors=True)
+
+    def path(self, name: str) -> str:
+        return os.path.join(self.dir, name)
+
+    def write(self, name: str, text: str) -> None:
+        if text is None:
+            return
+        with open(self.path(name), "w") as fh:
+            fh.write(text if isinstance(text, str) else json.dumps(text, indent=2))
+
+    def write_json(self, name: str, obj) -> None:
+        with open(self.path(name), "w") as fh:
+            json.dump(obj, fh, indent=2, default=str)
+
+
+# --------------------------------------------------------------------- building
+
+# Vivado is extremely chatty. These are the lines worth interrupting the user
+# for; everything else still lands in the local build.log.
+VIVADO_LOUD = re.compile(
+    r"^(ERROR|CRITICAL WARNING)\b|^Vivado.* is exiting|Abnormal program termination|"
+    r"^\s*Failed to|out of memory", re.IGNORECASE)
+VIVADO_PROGRESS = re.compile(
+    r"^(Starting|Finished|Phase \d|Running|Command:)|"
+    r"(synth_design|opt_design|place_design|phys_opt_design|route_design|"
+    r"write_bitstream) (Start|Complete)", re.IGNORECASE)
+
+
+def fmt_elapsed(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+
+def do_build(ssh: "Ssh", cfg: dict, project: str, runlog: RunLog,
+             force: bool = False, verbose: bool = False) -> bool:
+    """Start (or reattach to) a detached Vivado build and stream its log home.
+
+    The build runs in its own session on the server, so losing the SSH
+    connection -- or pressing Ctrl-C here -- does not kill it."""
+    b = cfg["build"]
+    opts = {
+        "tcl_script": b.get("tcl_script") or "",
+        "xpr": b.get("xpr") or "",
+        "jobs": int(b.get("jobs") or 0),
+        "simulation": bool(b.get("simulation", False)),
+        "simulation_fatal": bool(b.get("simulation_fatal", False)),
+        "export_xsa": b.get("export_xsa") or "",
+        "force": bool(force),
+    }
+    py, setup = cfg["remote"]["python"], cfg["remote"]["setup"]
+    agent = f"{py} ~/{REMOTE_AGENT_PATH}"
+    setup_arg = f"--setup {shlex.quote(setup)} " if setup else ""
+
+    started = remote_json(ssh.run(
+        f"{agent} build-start --project {rquote(project)} {setup_arg}"
+        f"--opts {shlex.quote(json.dumps(opts))}"))
+    if not started.get("ok"):
+        bad(started.get("error", "build could not be started"))
+        return False
+
+    if started.get("attached"):
+        warn(f"a build is already running on the server "
+             f"(pid {started['state']['pid']}, started "
+             f"{started['state'].get('started_iso','?')}) -- attaching to it")
+    else:
+        info(f"vivado launched detached on {ssh.host} "
+             f"(pid {started['state']['pid']})")
+        info("safe to Ctrl-C: the build keeps going and `fpgatest build` reattaches")
+
+    offset = 0
+    t0 = time.time()
+    last_beat = t0
+    stage = "starting"
+    failed_stage = None
+    poll = float(b.get("poll_s", 3))
+    log_fh = open(runlog.path("build.log"), "w")
+
+    try:
+        while True:
+            st = remote_json(ssh.run(
+                f"{agent} build-status --project {rquote(project)} --offset {offset}"))
+            state = st.get("state") or {}
+            chunk = st.get("chunk", "")
+            offset = st.get("next_offset", offset)
+
+            if chunk:
+                log_fh.write(chunk)
+                log_fh.flush()
+                for line in chunk.splitlines():
+                    if line.startswith(RESULT_MARKER):
+                        continue
+                    if line.startswith("##FPGATEST##"):
+                        parts = line.split("|")[1:]
+                        parts += ["-"] * (4 - len(parts))
+                        kind, name, status, detail = parts[:4]
+                        if kind == "plan":
+                            (info if status == "up-to-date" else ok)(
+                                f"{name}: {status}")
+                        elif kind == "stage":
+                            stage = name
+                            if status == "start":
+                                print(f"  {C.BLUE}>{C.RESET}     {name} running…")
+                            elif status == "ok":
+                                ok(f"{name}  ({fmt_elapsed(time.time() - t0)})")
+                            elif status == "skip":
+                                info(f"{name}: {detail}")
+                            else:
+                                bad(f"{name}  {detail}")
+                                failed_stage = name
+                        elif kind == "artifact":
+                            info(f"{name} -> {status}")
+                    elif VIVADO_LOUD.search(line):
+                        bad(line.strip()[:200])
+                    elif verbose and VIVADO_PROGRESS.search(line):
+                        info(line.strip()[:160])
+                last_beat = time.time()
+
+            if not state:
+                bad("build state disappeared on the server")
+                return False
+
+            if state.get("exit_code") is not None and not state.get("running"):
+                break
+
+            if time.time() - last_beat > 30:
+                print(f"  {C.DIM}·     {stage} … {fmt_elapsed(time.time() - t0)}"
+                      f"{C.RESET}", end="\r", flush=True)
+                last_beat = time.time()
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print()
+        warn("detached from the build -- it is still running on the server")
+        info(f"reattach with:  fpgatest build {project}")
+        raise
+    finally:
+        log_fh.close()
+
+    logs = remote_json(ssh.run(f"{agent} build-logs --project {rquote(project)}")).get("logs", {})
+    for name, text in logs.items():
+        runlog.write(name, text)
+
+    rc = state.get("exit_code")
+    if state.get("died"):
+        bad("the build process vanished without an exit code "
+            "(killed, out of memory, or the node went down)")
+        return False
+    if failed_stage or rc != 0:
+        bad(f"build failed at {failed_stage or 'vivado'} (exit {rc})")
+        info(f"full log: {runlog.path('vivado.log')}")
+        return False
+
+    ok(f"build complete in {fmt_elapsed(time.time() - t0)}")
+    return True
+
+
+# ------------------------------------------------------------------------ doctor
+
+def cmd_doctor(args, cfg, _cfg_path) -> int:
+    failures = 0
+
+    hdr("local python")
+    info(f"{sys.version.split()[0]} at {sys.executable}")
+    for mod, pkg in (("pyftdi", "pyftdi"), ("serial", "pyserial"), ("usb", "pyusb")):
+        try:
+            __import__(mod)
+            ok(f"{pkg} importable")
+        except ImportError:
+            bad(f"{pkg} missing -- pip install pyftdi pyserial pyusb")
+            failures += 1
+
+    hdr("ftdi cable")
+    try:
+        from pyftdi.ftdi import Ftdi
+        devices = Ftdi.list_devices()
+        if not devices:
+            bad("no FTDI device enumerated -- is the board powered and plugged in?")
+            failures += 1
+        for desc, _ in devices:
+            info(f"{desc.vid:04x}:{desc.pid:04x} sn={desc.sn} "
+                 f"desc={desc.description!r} iface={desc.index}")
+            ok("FTDI device present")
+    except Exception as exc:
+        bad(f"could not enumerate FTDI devices: {exc}")
+        failures += 1
+
+    hdr("jtag chain")
+    try:
+        import xvcd
+        cable = xvcd.FtdiJtag(cfg["cable"]["url"], float(cfg["cable"]["frequency_hz"]))
+        ids = cable.scan_chain()
+        cable.close()
+        if not ids:
+            bad("TAP responded but no IDCODEs came back -- check the JTAG jumper "
+                "(JP2 must not be forcing SD/QSPI-only boot) and cable wiring")
+            failures += 1
+        for idcode in ids:
+            ok(xvcd.describe_idcode(idcode))
+        if len(ids) == 1:
+            warn("only one TAP visible; Zynq usually shows the ARM DAP *and* the "
+                 "PL device. PS debug will not work in independent JTAG mode.")
+    except Exception as exc:
+        bad(f"JTAG probe failed: {exc}")
+        if sys.platform == "darwin":
+            info("macOS holds FTDI interfaces with its own driver. If the open "
+                 "failed with a resource/claim error, try:")
+            info("  sudo kextunload -b com.apple.driver.AppleUSBFTDI   (Intel)")
+            info("  or disable the AppleUSBFTDI dext, then replug the board.")
+            info("Note this also removes /dev/cu.usbserial-*, so UART tests will "
+                 "need `uart.enabled = false`.")
+        failures += 1
+
+    hdr("uart")
+    port = cfg["uart"]["port"] or UartCapture.autodetect()
+    if port:
+        ok(f"serial port {port}")
+    else:
+        warn("no /dev/cu.usbserial-* found; UART assertions will be skipped")
+
+    hdr(f"remote host: {cfg['remote']['host']}")
+    ssh = Ssh(cfg["remote"]["host"])
+    try:
+        ssh.connect()
+        ok("ssh master established")
+        setup = cfg["remote"]["setup"]
+        # Newlines, not "; ": a multi-line remote.setup joined with semicolons
+        # produces "...\n; for t in ..." which is a bash syntax error, and the
+        # probe then silently returns nothing -- which used to read as a pass.
+        probe = "\n".join(filter(None, [
+            setup,
+            'for t in vivado hw_server xsdb xsct; do '
+            'printf "%s -> %s\\n" "$t" "$(command -v $t || echo MISSING)"; done',
+            f'{cfg["remote"]["python"]} -c '
+            '"import sys; print(\'python -> \' + sys.version.split()[0])"',
+        ]))
+        proc = ssh.run(probe)
+        lines = [l for l in proc.stdout.decode(errors="replace").splitlines() if l.strip()]
+        found = {}
+        if not lines:
+            bad("the remote probe produced no output at all")
+            info("remote.setup is almost certainly not valid shell. stderr:")
+            for line in proc.stderr.decode(errors="replace").splitlines()[:8]:
+                info(f"  {line}")
+            failures += 1
+        for line in lines:
+            tool = line.split(" -> ")[0].strip()
+            found[tool] = "MISSING" not in line
+            (bad if "MISSING" in line else ok)(line)
+
+        if lines:
+            if not found.get("vivado"):
+                bad("vivado is not on PATH -- building is impossible")
+                failures += 1
+            if not found.get("hw_server"):
+                bad("hw_server is not on PATH -- programming is impossible")
+                failures += 1
+            if not (found.get("xsdb") or found.get("xsct")):
+                bad("neither xsdb nor xsct found: this looks like a Vivado-only "
+                    "install. --mode pl-only will still program the PL, but "
+                    "ps7_init and the register testbench both need Vitis.")
+                failures += 1
+
+        if cfg["remote"]["project"]:
+            proc = ssh.run(f'test -d {rquote(cfg["remote"]["project"])} && echo yes')
+            if b"yes" in proc.stdout:
+                ok(f"project directory {cfg['remote']['project']}")
+            else:
+                bad(f"project directory not found: {cfg['remote']['project']}")
+                failures += 1
+        import socket as _socket
+
+        listener = _socket.socket()
+        listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(15)
+        local = listener.getsockname()[1]
+        remote_port = ssh.forward_remote(local)
+
+        got = {}
+
+        def _serve():
+            try:
+                conn, _ = listener.accept()
+                got["data"] = conn.recv(16)
+                conn.sendall(b"pong\n")
+                conn.close()
+            except Exception as exc:
+                got["error"] = str(exc)
+
+        t = threading.Thread(target=_serve, daemon=True)
+        t.start()
+        # bash's /dev/tcp is enough; nothing extra needs to exist on the server.
+        probe = ssh.run(
+            f"exec 3<>/dev/tcp/127.0.0.1/{remote_port} && "
+            f"printf ping >&3 && head -c 4 <&3", timeout=25)
+        t.join(timeout=20)
+        listener.close()
+
+        if got.get("data") == b"ping" and b"pong" in probe.stdout:
+            ok(f"reverse tunnel carries data "
+               f"({ssh.host}:{remote_port} -> localhost:{local})")
+        else:
+            bad("the reverse tunnel was allocated but no data crossed it")
+            info("this is exactly what stops hw_server from opening the XVC "
+                 "cable")
+            info(f"sshd may have AllowTcpForwarding or GatewayPorts "
+                 f"restrictions. remote said: "
+                 f"{probe.stderr.decode(errors='replace').strip()[:200]!r}")
+            failures += 1
+    except Exception as exc:
+        bad(f"remote check failed: {exc}")
+        failures += 1
+    finally:
+        ssh.close()
+
+    print()
+    if failures:
+        print(f"{C.RED}{failures} problem(s) found{C.RESET}")
+    else:
+        print(f"{C.GREEN}all checks passed{C.RESET}")
+    return 1 if failures else 0
+
+
+def _free_local_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# -------------------------------------------------------------------------- scan
+
+def cmd_scan(args, cfg, _cfg_path) -> int:
+    import xvcd
+    cable = xvcd.FtdiJtag(cfg["cable"]["url"], float(cfg["cable"]["frequency_hz"]))
+    ids = cable.scan_chain()
+    cable.close()
+    if not ids:
+        bad("empty JTAG chain")
+        return 1
+    for i, idcode in enumerate(ids):
+        print(f"  tap{i}: {xvcd.describe_idcode(idcode)}")
+    return 0
+
+
+# --------------------------------------------------------------------------- run
+
+def print_manifest(m: dict) -> None:
+    hdr("artifacts under test")
+    header = m.get("bit_header", {})
+    info(f"bit    {m['bit']}")
+    info(f"       from {m['bit_source']}  sha {m['bit_sha256']}")
+    if header:
+        info(f"       design={header.get('design','?')} part={header.get('part','?')} "
+             f"built {header.get('date','?')} {header.get('time','?')}")
+    info(f"xsa    {m.get('xsa') or '(none)'}")
+    info(f"elf    {m.get('elf') or '(none)'}")
+    if m.get("coherent") is True:
+        ok("bitstream matches the hardware handoff the ELF was built against")
+    elif m.get("coherent") is False:
+        bad("bitstream / XSA mismatch")
+    for note in m.get("notes", []):
+        info(note)
+    for w in m.get("warnings", []):
+        warn(w)
+
+
+def _prepare_remote(ssh: "Ssh", cfg: dict) -> None:
+    with open(REMOTE_AGENT, "rb") as fh:
+        agent_src = fh.read()
+    ssh.run(f"mkdir -p $(dirname ~/{REMOTE_AGENT_PATH}) && cat > ~/{REMOTE_AGENT_PATH}",
+            stdin_data=agent_src)
+
+
+def _discover(ssh: "Ssh", cfg: dict, project: str) -> dict:
+    return remote_json(ssh.run(
+        f"{cfg['remote']['python']} ~/{REMOTE_AGENT_PATH} discover --project {rquote(project)}"))
+
+
+def _needs_build(manifest: dict) -> list:
+    reasons = []
+    if not manifest.get("ok"):
+        reasons.append("no bitstream found")
+        return reasons
+    if manifest.get("coherent") is False:
+        reasons.append("bitstream does not match the XSA")
+    if manifest.get("stale_sources"):
+        reasons.append(f"{len(manifest['stale_sources'])} source file(s) newer "
+                       "than the bitstream")
+    return reasons
+
+
+def cmd_build(args, cfg, _cfg_path) -> int:
+    host = args.host or cfg["remote"]["host"]
+    project = args.project or cfg["remote"]["project"]
+    if not project:
+        bad("no project directory: pass one or set remote.project in the config")
+        return 2
+    runlog = RunLog(cfg["log"]["dir"], project, int(cfg["log"]["keep"]))
+    info(f"logs: {runlog.dir}")
+
+    ssh = Ssh(host)
+    try:
+        ssh.connect()
+        _prepare_remote(ssh, cfg)
+        hdr("build")
+        okay = do_build(ssh, cfg, project, runlog,
+                        force=args.force, verbose=args.verbose)
+        if okay:
+            manifest = _discover(ssh, cfg, project)
+            if manifest.get("ok"):
+                print_manifest(manifest)
+                runlog.write_json("manifest.json", manifest)
+        return 0 if okay else 1
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        bad(str(exc))
+        return 2
+    finally:
+        ssh.close()
+
+
+def cmd_run(args, cfg, _cfg_path) -> int:
+    import xvcd
+
+    host = args.host or cfg["remote"]["host"]
+    project = args.project or cfg["remote"]["project"]
+    if not project:
+        bad("no project directory: pass --project or set remote.project in the config")
+        return 2
+
+    runlog = RunLog(cfg["log"]["dir"], project, int(cfg["log"]["keep"]))
+    info(f"logs: {runlog.dir}")
+
+    spec = {
+        "base": cfg["hw"].get("base", "0x0"),
+        "tests": [t for t in cfg["tests"]
+                  if not args.only or t.get("name") == args.only],
+        "settle_ms": cfg["run"]["settle_ms"],
+    }
+    # A typo in --only used to filter every test out and then report a happy
+    # "0 failed" after a full programming cycle. Refuse instead, and say what
+    # the real names are so the typo is obvious.
+    if args.only and not spec["tests"]:
+        bad(f"--only {args.only!r} matched no test in {_cfg_path or 'the config'}")
+        for t in cfg["tests"]:
+            info(f"available: {t.get('name', '(unnamed)')!r}")
+        return 2
+    uart_tests = [t for t in spec["tests"]
+                  if t.get("uart_expect") or t.get("uart_reject")]
+    confirm_tests = [t for t in spec["tests"] if t.get("confirm")]
+
+    # --- local cable, before anything slow happens ---------------------------
+    hdr("local cable")
+    local_port = _free_local_port()
+    try:
+        server = xvcd.serve(
+            "127.0.0.1", local_port, cfg["cable"]["url"],
+            float(cfg["cable"]["frequency_hz"]), int(cfg["cable"]["vector_bytes"]))
+    except xvcd.CableError as exc:
+        bad(str(exc))
+        return 2
+    ids = server.cable.scan_chain()
+    for idcode in ids:
+        ok(xvcd.describe_idcode(idcode))
+    if not ids:
+        bad("JTAG chain is empty; refusing to continue")
+        return 2
+
+    uart = None
+    if cfg["uart"]["enabled"] and not args.no_uart:
+        port = cfg["uart"]["port"] or UartCapture.autodetect()
+        if port:
+            try:
+                uart = UartCapture(port, int(cfg["uart"]["baud"]))
+                uart.start()
+                ok(f"UART capture on {port} @ {cfg['uart']['baud']}")
+            except Exception as exc:
+                warn(f"UART capture unavailable ({exc})")
+        elif uart_tests:
+            warn("UART tests defined but no serial port found")
+
+    ssh = Ssh(host)
+    result = None
+    try:
+        hdr(f"remote: {host}")
+        ssh.connect()
+        remote_port = ssh.forward_remote(local_port)
+        ok(f"reverse tunnel: {host}:{remote_port} -> localhost:{local_port}")
+        _prepare_remote(ssh, cfg)
+        ok(f"agent synced to ~/{REMOTE_AGENT_PATH}")
+
+        manifest = _discover(ssh, cfg, project)
+        reasons = _needs_build(manifest)
+
+        # --- build if the artifacts are not current ------------------------
+        want_build = args.build or (cfg["build"]["enabled"] and reasons
+                                    and not args.no_build)
+        if want_build:
+            hdr("build")
+            if args.build and not reasons:
+                info("forced rebuild requested")
+            for reason in reasons:
+                info(f"needs build: {reason}")
+            if not do_build(ssh, cfg, project, runlog,
+                            force=args.build, verbose=args.verbose):
+                return 4
+            manifest = _discover(ssh, cfg, project)
+            reasons = _needs_build(manifest)
+        elif reasons and args.no_build:
+            for reason in reasons:
+                warn(f"{reason} (building disabled)")
+
+        if not manifest.get("ok"):
+            bad(manifest.get("error", "discovery failed"))
+            return 2
+        print_manifest(manifest)
+        runlog.write_json("manifest.json", manifest)
+
+        if reasons and not args.force:
+            print()
+            bad("refusing to program: " + "; ".join(reasons))
+            info("let fpgatest build (drop --no-build), or pass --force")
+            return 3
+
+        # --- mode ----------------------------------------------------------
+        mode = args.mode or cfg["run"].get("mode", "auto")
+        if args.no_elf:
+            mode = "bit"
+        if mode == "auto":
+            mode = "full" if manifest.get("elf") else "bit"
+        spec["mode"] = mode
+
+        # The quiet killer: in JTAG boot mode the BootROM runs no FSBL, so
+        # FCLK_CLK0 is dead until ps7_init -- and ps7_init needs the XSA. With
+        # no XSA the bitstream loads, DONE lights up, and the design sits
+        # unclocked. That is indistinguishable from a broken design.
+        if mode in ("bit", "full") and not manifest.get("xsa"):
+            warn("no XSA found, so ps7_init cannot run and FCLK_CLK0 will not "
+                 "start")
+            info("if the PL is clocked from the PS, this will program cleanly "
+                 "and then do nothing at all")
+            info("fix: set build.export_xsa in the config, or run "
+                 "write_hw_platform -fixed -include_bit in Vivado")
+
+        if mode == "pl-only" and any(t.get("ops") for t in spec["tests"]):
+            warn("pl-only skips ps7_init, so register tests are dropped "
+                 "(no FCLK, no PS-PL access)")
+            spec["tests"] = [t for t in spec["tests"] if not t.get("ops")]
+
+        hdr(f"program and test  ({mode})")
+        py, setup = cfg["remote"]["python"], cfg["remote"]["setup"]
+        cmd = (f"{py} ~/{REMOTE_AGENT_PATH} run --project {rquote(project)} "
+               f"--xvc-port {remote_port} "
+               f"--manifest {shlex.quote(json.dumps(manifest))} "
+               f"--spec {shlex.quote(json.dumps(spec))} "
+               f"--timeout {cfg['run']['timeout_s']} "
+               + (f"--setup {shlex.quote(setup)} " if setup else "")
+               + "--emit-tcl ")
+        # A bitstream download is the one step that can legitimately take
+        # minutes, and a wedged one looks identical to a working one unless the
+        # cable reports what it is doing.
+        stop_monitor = threading.Event()
+
+        def monitor() -> None:
+            waited, last_bits = 0.0, 0
+            while not stop_monitor.wait(5):
+                waited += 5
+                st = server.cable.stats
+                if not st["shifts"]:
+                    if waited >= 20:
+                        print(f"  {C.DIM}·     hw_server has not opened the "
+                              f"cable yet ({waited:.0f}s){C.RESET}")
+                    continue
+                bits, shifts = st["bits"], st["shifts"]
+                rate = (bits - last_bits) / 5000.0
+                last_bits = bits
+                print(f"  {C.DIM}·     jtag {bits / 1e6:.2f} Mbit in {shifts} "
+                      f"shifts ({bits // shifts // 1000} kbit each), "
+                      f"{rate:.0f} kbit/s{C.RESET}")
+
+        threading.Thread(target=monitor, daemon=True, name="xvc-monitor").start()
+        try:
+            proc = ssh.run(cmd, stream_stderr=True,
+                           timeout=float(cfg["run"]["timeout_s"]) + 120)
+        finally:
+            stop_monitor.set()
+        st = server.cable.stats
+        if st["shifts"]:
+            info(f"jtag total: {st['bits'] / 1e6:.2f} Mbit in {st['shifts']} "
+                 f"shifts, {st['bits'] // st['shifts'] // 1000} kbit per shift")
+        result = remote_json(proc)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        bad(str(exc))
+        return 2
+    finally:
+        ssh.close()
+
+    if result:
+        runlog.write_json("run.json", result)
+        runlog.write("xsdb.log", result.get("xsdb_log"))
+        runlog.write("hw_server.log", result.get("hw_server_log"))
+        runlog.write("program.tcl", result.get("tcl"))
+
+    if args.emit_tcl and result.get("tcl"):
+        hdr("generated xsdb script")
+        print(result["tcl"])
+
+    if not result.get("ok"):
+        bad(result.get("error", "remote run failed"))
+        if result.get("hw_server_log"):
+            print(result["hw_server_log"])
+        server.shutdown()
+        if uart:
+            uart.stop()
+        return 2
+
+    # --- report ------------------------------------------------------------
+    passed = failed = 0
+    events = result["events"]
+    reached_end = any(e["kind"] == "done" for e in events)
+    programmed = any(e["kind"] == "step" and e["name"] == "program_pl"
+                     and e["status"] == "ok" for e in events)
+    for ev in events:
+        kind, name, status, detail = (ev["kind"], ev["name"],
+                                      ev["status"], ev["detail"])
+        if kind == "testbegin":
+            print(f"  {C.DIM}--- {name}{C.RESET}")
+        elif kind == "step":
+            (ok if status == "ok" else bad)(
+                f"{name}" + (f"  {detail}" if status != "ok" else ""))
+            failed += status != "ok"
+        elif kind == "test":
+            if status == "pass":
+                ok(f"{name}  {detail}")
+                passed += 1
+            else:
+                bad(f"{name}  {detail}")
+                failed += 1
+
+    if not reached_end:
+        bad("the xsdb script stopped before it finished")
+        failed += 1
+    if not programmed:
+        bad("the bitstream was never loaded")
+        st = server.cable.stats
+        if not st["connections"]:
+            info("hw_server never opened the XVC cable at all, so it saw no "
+                 "JTAG targets")
+            info("that is the reverse tunnel or auto-open-servers, not the "
+                 "board: `fpgatest doctor` now tests the tunnel end to end")
+        elif st["shifts"] == 4:
+            # 4 is exactly what our own start-up chain scan costs, so anything
+            # more means hw_server did shift; anything equal means it did not.
+            info(f"hw_server opened the cable {st['connections']}x but never "
+                 "shifted a single bit")
+            info("that usually means it rejected the advertised vector length")
+        if st.get("trace"):
+            hdr("xvc conversation")
+            for line in st["trace"][:20]:
+                print(f"  {C.DIM}{line}{C.RESET}")
+        hdr("xsdb output")
+        for line in (result.get("xsdb_log") or "").strip().splitlines()[-25:]:
+            print(f"  {C.DIM}{line}{C.RESET}")
+        hdr("hw_server output")
+        for line in (result.get("hw_server_log") or "").strip().splitlines()[-25:]:
+            print(f"  {C.DIM}{line}{C.RESET}")
+
+    # Asking someone to eyeball a board that was never programmed is worse than
+    # useless: it invites a "no" that looks like a design bug.
+    if confirm_tests and not programmed:
+        warn("skipping visual checks: nothing was programmed")
+        confirm_tests = []
+
+    if uart_tests and uart:
+        hdr("uart assertions")
+        time.sleep(float(cfg["uart"]["settle_s"]))
+        for t in uart_tests:
+            pattern = t.get("uart_expect") or t["uart_reject"]
+            name = t.get("name", pattern)
+            timeout = float(t.get("timeout_s", 10))
+            seen = uart.wait_for(pattern, timeout)
+            if t.get("uart_expect"):
+                if seen:
+                    ok(f"{name}  matched /{pattern}/")
+                    passed += 1
+                else:
+                    bad(f"{name}  never saw /{pattern}/ in {timeout:g}s")
+                    failed += 1
+            else:
+                if seen:
+                    bad(f"{name}  saw forbidden /{pattern}/")
+                    failed += 1
+                else:
+                    ok(f"{name}  /{pattern}/ absent")
+                    passed += 1
+
+    # Some faults are invisible to both AXI and UART. A mirrored segment map
+    # reads back a perfectly correct result register while the display shows
+    # the wrong digits; a missing pipeline pragma shows up only as flicker.
+    # For those, the only instrument is a person looking at the board.
+    if confirm_tests:
+        hdr("visual confirmation")
+        if args.no_confirm or not sys.stdin.isatty():
+            for t in confirm_tests:
+                warn(f"skipped (not interactive): {t['confirm']}")
+        else:
+            for t in confirm_tests:
+                name = t.get("name", t["confirm"])
+                try:
+                    answer = input(f"  {C.BOLD}?{C.RESET}     {t['confirm']} [y/n/s] ")
+                except EOFError:
+                    answer = "s"
+                answer = answer.strip().lower()[:1]
+                if answer == "y":
+                    ok(name)
+                    passed += 1
+                elif answer == "s":
+                    warn(f"{name}  skipped")
+                else:
+                    bad(name)
+                    failed += 1
+
+    if uart:
+        text = uart.text()
+        uart.stop()
+        runlog.write("uart.log", text)
+        if text.strip() and (args.show_uart or failed):
+            hdr("uart output")
+            for line in text.strip().splitlines()[-40:]:
+                print(f"  {C.DIM}{line}{C.RESET}")
+    server.shutdown()
+
+    print()
+    print(f"{C.DIM}logs: {runlog.dir}{C.RESET}")
+    verdict = f"{C.GREEN}PASS{C.RESET}" if not failed else f"{C.RED}FAIL{C.RESET}"
+    print(f"{verdict}  {passed} passed, {failed} failed")
+    return 0 if not failed else 1
+
+
+# -------------------------------------------------------------------------- main
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="fpgatest",
+        description="Test a remotely-built bitstream on a locally-attached FPGA.")
+    ap.add_argument("-c", "--config", help="path to fpgatest.toml")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("doctor", help="check every link in the chain")
+    d.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("scan", help="probe the JTAG chain and print IDCODEs")
+    s.set_defaults(func=cmd_scan)
+
+    b = sub.add_parser("build", help="build on the server if it is out of date")
+    b.add_argument("project", nargs="?", help="remote project directory")
+    b.add_argument("--host")
+    b.add_argument("--force", action="store_true", help="rebuild even if current")
+    b.add_argument("-v", "--verbose", action="store_true",
+                   help="echo Vivado progress lines")
+    b.set_defaults(func=cmd_build)
+
+    r = sub.add_parser("run", help="build if needed, then program and test")
+    r.add_argument("project", nargs="?", help="remote project directory")
+    r.add_argument("--host")
+    r.add_argument("--only", help="run a single named test")
+    r.add_argument("--mode", choices=("auto", "pl-only", "bit", "full"),
+                   help="pl-only: just `fpga -file`. bit: + ps7_init, no ELF. "
+                        "full: + download and run the application.")
+    r.add_argument("--no-elf", action="store_true",
+                   help="shorthand for --mode bit")
+    r.add_argument("--build", action="store_true",
+                   help="rebuild on the server even if it looks current")
+    r.add_argument("--no-build", action="store_true",
+                   help="never build; fail if the artifacts are stale")
+    r.add_argument("-v", "--verbose", action="store_true",
+                   help="echo Vivado progress lines during a build")
+    r.add_argument("--no-uart", action="store_true")
+    r.add_argument("--no-confirm", action="store_true",
+                   help="skip interactive visual checks")
+    r.add_argument("--show-uart", action="store_true")
+    r.add_argument("--emit-tcl", action="store_true",
+                   help="print the generated xsdb script")
+    r.add_argument("--force", action="store_true",
+                   help="run even if the artifacts look stale or mismatched")
+    r.set_defaults(func=cmd_run)
+
+    args = ap.parse_args()
+    cfg, cfg_path = load_config(args.config)
+    if cfg_path:
+        print(f"{C.DIM}config: {cfg_path}{C.RESET}")
+    try:
+        return args.func(args, cfg, cfg_path)
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
