@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# setup.sh creates this; it is machine-specific and must not be shared.
+.venv/
+.dist/
+
+.DS_Store
+*.tmp
