@@ -51,6 +51,24 @@ SKIP_DIRS = re.compile(
     r"(^|/)(\.git|\.Xil|\.jobs|ip_user_files|sim_\w+|\.metadata|_ide)(/|$)"
 )
 
+# Extraction byproducts of our own flow, excluded from the staleness scan only.
+#
+# `loadhw -hw <project>/x.xsa` makes xsdb unpack the XSA next to itself, which
+# drops a drivers/ tree and ps7_init.* into the project directory with a fresh
+# mtime on every run. The staleness scan then sees them as design sources newer
+# than the bitstream and the next run refuses to program. Building cannot clear
+# it: synth and impl really are up to date, so the .bit keeps its old timestamp
+# and the condition is permanent -- a successful run makes the next one
+# impossible.
+#
+# Deliberately NOT added to SKIP_DIRS: that is also consulted when discovering
+# .bit/.xsa/.elf artifacts, and hiding a whole directory from artifact
+# discovery to fix a timestamp problem is a wider change than the bug needs.
+STALE_SKIP = re.compile(
+    r"(^|/)drivers(/|$)"
+    r"|(^|/)(ps7_init|psu_init)(_gpl)?\.(c|h|tcl|html)$"
+)
+
 
 # --------------------------------------------------------------------- helpers
 
@@ -211,7 +229,7 @@ def discover(project: str, hints: dict) -> dict:
     stale: list[str] = []
     for pattern in SOURCE_GLOBS:
         for path in rglob(project, pattern):
-            if SKIP_DIRS.search(path):
+            if SKIP_DIRS.search(path) or STALE_SKIP.search(path):
                 continue
             try:
                 if os.path.getmtime(path) > bit_mtime + 1:
@@ -249,6 +267,243 @@ def discover(project: str, hints: dict) -> dict:
     return manifest
 
 
+
+
+# --------------------------------------------------------------- build reports
+#
+# Utilisation and timing are properties of the build, not of the board, so they
+# come out of the implementation reports rather than off the wire. Both the
+# Vivado project flow and the Vitis v++ link flow emit the same Vivado report
+# format, which is why one parser serves both.
+
+# Vivado names these rows differently across families (7-series says "Slice",
+# UltraScale says "CLB"), and the report nests indented sub-rows such as
+# "LUT as Logic" beneath the totals. Matching the stripped name exactly keeps
+# a sub-row from being reported as the total.
+UTIL_ROWS = {
+    "lut":  ("Slice LUTs", "CLB LUTs", "Slice LUTs*"),
+    "ff":   ("Slice Registers", "CLB Registers"),
+    "bram": ("Block RAM Tile", "Block RAM Tile*"),
+    "dsp":  ("DSPs", "DSPs*"),
+}
+
+
+def parse_utilization(path: str) -> dict:
+    """Headline resource rows from a Vivado utilisation report."""
+    out: dict = {}
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) < 4:
+                continue
+            for key, names in UTIL_ROWS.items():
+                if key in out or cells[0] not in names:
+                    continue
+                try:
+                    # Column count differs between report versions, so index
+                    # the two that matter from the right-hand end.
+                    out[key] = {"used": int(cells[1]),
+                                "available": int(cells[-2]),
+                                "pct": float(cells[-1])}
+                except ValueError:
+                    pass
+    return out
+
+
+def parse_timing(path: str) -> dict:
+    """Worst negative slack from a Vivado timing summary."""
+    with open(path, errors="replace") as fh:
+        lines = fh.readlines()
+    for i, line in enumerate(lines):
+        if "WNS(ns)" not in line:
+            continue
+        # The numbers sit a couple of lines below the header, past a rule.
+        for follow in lines[i + 1:i + 5]:
+            nums = re.findall(r"-?\d+\.\d+", follow)
+            if nums:
+                return {"wns_ns": float(nums[0])}
+    return {}
+
+
+def parse_csynth(path: str) -> dict:
+    """Per-module resources and latency from a Vitis HLS C-synthesis report.
+
+    Two pipe-delimited tables are keyed by module name: one carries latency in
+    cycles, the other BRAM/DSP/FF/LUT. They are told apart by column count --
+    the latency table has min/max pairs for cycles, absolute time and interval,
+    the resource table does not.
+
+    These are HLS *estimates*. They are not what the device ends up using: on
+    this design csynth totals 28 DSP where implementation used 56. Anything
+    printed from here has to say so.
+    """
+    mods: dict = {}
+    top: dict = {}
+
+    def row(cells):
+        return mods.setdefault(cells[1], {"module": cells[1]})
+
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if not line.lstrip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+
+            # Top-level latency summary: cycles min/max, then absolute times.
+            if (len(cells) == 7 and cells[0].isdigit() and cells[1].isdigit()
+                    and cells[2].endswith(("us", "ns", "ms", "sec"))):
+                top["latency_min"] = int(cells[0])
+                top["latency_max"] = int(cells[1])
+                top["latency_abs"] = cells[3]
+                continue
+
+            if len(cells) < 7 or not cells[1] or cells[1] == "Module":
+                continue
+
+            # Per-instance latency: Instance | Module | min | max | abs | abs | ...
+            if len(cells) == 9 and cells[2].isdigit() and cells[3].isdigit():
+                r = row(cells)
+                r["latency_min"] = int(cells[2])
+                r["latency_max"] = int(cells[3])
+                r["latency_abs"] = cells[5] or cells[4]
+            # Per-instance area: Instance | Module | BRAM | DSP | FF | LUT | URAM
+            elif len(cells) == 7 and all(c.lstrip("-").isdigit() or c == "-"
+                                         for c in cells[2:7]):
+                r = row(cells)
+                for key, cell in zip(("bram", "dsp", "ff", "lut"), cells[2:6]):
+                    r[key] = int(cell) if cell.lstrip("-").isdigit() else 0
+
+    # "Total" is a summary row, not a module.
+    total = mods.pop("", None) or {}
+    for name in [n for n in mods if n.lower() == "total"]:
+        total = mods.pop(name)
+    if total:
+        top.update({k: v for k, v in total.items() if k != "module"})
+    return {"top": top, "modules": mods}
+
+
+def parse_hier_utilization(path: str) -> dict:
+    """Per-instance resources from `report_utilization -hierarchical`.
+
+    Unlike the C-synthesis estimate these are what the device actually holds
+    after place and route, broken down by cell. Columns are read from the
+    header rather than by position, because the set differs between families.
+    """
+    out: dict = {}
+    cols: dict = {}
+    want = {"Total LUTs": "lut", "FFs": "ff", "DSP Blocks": "dsp",
+            "RAMB36": "bram36", "RAMB18": "bram18"}
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if not line.lstrip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if not cols:
+                if "Instance" in cells and "Module" in cells:
+                    cols = {want[c]: i for i, c in enumerate(cells) if c in want}
+                continue
+            if len(cells) < 3 or not cells[0]:
+                continue
+            # Every cell appears twice: "name" is the subtree total, "(name)"
+            # is that cell's own logic with children excluded. The DSP macros
+            # live in the children, so the parenthesised row reports 0 DSP --
+            # taking it would silently zero the most interesting column.
+            if cells[0].startswith("("):
+                continue
+            row = {}
+            for key, idx in cols.items():
+                if idx < len(cells) and cells[idx].lstrip("-").isdigit():
+                    row[key] = int(cells[idx])
+            if not row:
+                continue
+            # Two BRAM columns; the device budget is counted in 18K tiles.
+            row["bram"] = row.pop("bram36", 0) * 2 + row.pop("bram18", 0)
+            out[cells[0]] = row
+    return out
+
+
+def hier_utilization(project: str, setup: str = "") -> tuple[dict, str]:
+    """Per-instance post-route utilization, generating the report if needed.
+
+    Vivado writes no hierarchical breakdown during a normal implementation
+    run, so it has to be produced from the routed checkpoint. That costs a
+    couple of minutes, so the result is cached next to the agent and only
+    regenerated when the checkpoint is newer than the cache.
+    """
+    dcp = newest(rglob(project, "**/impl_*/*_routed.dcp")
+                 or rglob(project, "**/impl_*/*_postroute*.dcp"))
+    if not dcp:
+        return {}, ""
+
+    cache_dir = os.path.expanduser("~/.cache/fpgatest/reports")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache = os.path.join(
+        cache_dir, hashlib.sha1(dcp.encode()).hexdigest()[:12] + "-hier.rpt")
+
+    if not os.path.isfile(cache) or os.path.getmtime(cache) < os.path.getmtime(dcp):
+        script = tempfile.NamedTemporaryFile("w", suffix=".tcl", delete=False)
+        script.write(f"open_checkpoint {shlex.quote(dcp)}\n"
+                     f"report_utilization -hierarchical -hierarchical_depth 6 "
+                     f"-file {shlex.quote(cache)}\nexit\n")
+        script.close()
+        proc = bash(f"vivado -mode batch -nojournal -nolog -source {script.name}",
+                    setup, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc.wait(timeout=900)
+        if not os.path.isfile(cache):
+            return {}, ""
+    return parse_hier_utilization(cache), cache
+
+
+def reports(project: str, csynth: str = "", setup: str = "") -> dict:
+    project = os.path.abspath(os.path.expanduser(project))
+    if not os.path.isdir(project):
+        return {"ok": False, "error": f"project directory not found: {project}"}
+
+    util_path = newest(rglob(project, "**/*utilization_placed.rpt")
+                       or rglob(project, "**/*utilization*.rpt"))
+    timing_path = newest(rglob(project, "**/*timing_summary_routed.rpt")
+                         or rglob(project, "**/*timing_summary*.rpt"))
+
+    result: dict = {"ok": True, "utilization": {}, "timing": {},
+                    "utilization_report": util_path, "timing_report": timing_path}
+    for path, key, fn in ((util_path, "utilization", parse_utilization),
+                          (timing_path, "timing", parse_timing)):
+        if not path:
+            continue
+        try:
+            result[key] = fn(path)
+        except OSError as exc:
+            result.setdefault("warnings", []).append(f"{path}: {exc}")
+
+    # HLS estimates, per module. Lives outside the Vivado project (the HLS
+    # project is a separate tree), so the path has to be given rather than
+    # discovered.
+    # Real per-instance figures, if a routed checkpoint is available.
+    try:
+        hier, hier_path = hier_utilization(project, setup)
+        if hier:
+            result["hierarchy"] = hier
+            result["hierarchy_report"] = hier_path
+    except Exception as exc:
+        result.setdefault("warnings", []).append(
+            f"hierarchical utilization unavailable: {exc}")
+
+    if csynth:
+        csynth = os.path.abspath(os.path.expanduser(csynth))
+        if os.path.isdir(csynth):
+            csynth = newest(rglob(csynth, "**/*_csynth.rpt")) or ""
+        if csynth and os.path.isfile(csynth):
+            try:
+                result["csynth"] = parse_csynth(csynth)
+                result["csynth_report"] = csynth
+            except OSError as exc:
+                result.setdefault("warnings", []).append(f"{csynth}: {exc}")
+        else:
+            result.setdefault("warnings", []).append(
+                f"no C-synthesis report at {csynth or '(unset)'}")
+    return result
 
 
 # ------------------------------------------------------------------ build side
@@ -709,6 +964,16 @@ if {[llength $ft_tgts] == 0} {
         # the DAP refuses register and memory access on a running core, so the
         # CPU has to be halted first -- this is the `stop` that Vitis' own
         # debug launcher issues at exactly this point.
+        # Memory access below goes through this core's MMU. SCTLR.M survives a
+        # `stop`, so anything that ran earlier -- a previous ELF, or a
+        # bootloader if the board is not strapped for JTAG boot -- leaves
+        # translation enabled and every physical address faults, including
+        # ps7_init's own writes to 0xF8000000. Resetting the core clears it.
+        # Unlike `rst -system` this leaves the DAP alone, so it is safe over
+        # XVC. Non-fatal: on a core that was already clean, or an xsdb without
+        # the option, the run carries on unaffected.
+        a('ft_step cpu_reset {if {[catch {rst -processor} e]} '
+          '{ ft info cpu_reset [string map {| /} $e] }}')
         # Already-halted is the normal case in JTAG boot, not a failure.
         a('ft_step stop_cpu {if {[catch {stop} e] '
           '&& ![string match "*Already stopped*" $e]} { error $e }}')
@@ -730,9 +995,16 @@ if {[llength $ft_tgts] == 0} {
 
     def emit_tests(stage: str) -> None:
         for test in spec.get("tests", []):
-            if not test.get("ops"):
-                continue
             if test.get("stage", "pre_elf") != stage:
+                continue
+            # Banners and notes are emitted from here rather than printed by
+            # the CLI so that they keep their place in the sequence: the tests
+            # run on this side and stream back, so anything interleaved with
+            # them has to travel in the same stream.
+            if test.get("banner"):
+                a(f"ft banner {tcl_quote(test['banner'])} - -")
+                continue
+            if not test.get("ops"):
                 continue
             base = int(str(test.get("base", spec.get("base", "0x0"))), 0)
             name = tcl_quote(test.get("name", "unnamed"))
@@ -751,6 +1023,9 @@ if {[llength $ft_tgts] == 0} {
                     a(f"ft_expect {name} {hex(addr)} {want}")
                 elif "delay_ms" in op:
                     a(f"after {int(op['delay_ms'])}")
+            for line in ([test["note"]] if test.get("note") else
+                         list(test.get("notes") or [])):
+                a(f"ft note {tcl_quote(line)} - -")
 
     emit_tests("pre_elf")
 
@@ -846,9 +1121,14 @@ def run(args) -> dict:
                 events.append({"kind": kind, "name": name,
                                "status": status, "detail": detail})
                 if not args.quiet:
-                    detail_txt = "" if detail == "-" else f"  {detail}"
-                    print(f"    [{status:>4}] {kind} {name}{detail_txt}",
-                          file=sys.stderr, flush=True)
+                    if kind == "banner":
+                        print(f"\n  == {name}", file=sys.stderr, flush=True)
+                    elif kind == "note":
+                        print(f"           {name}", file=sys.stderr, flush=True)
+                    else:
+                        detail_txt = "" if detail == "-" else f"  {detail}"
+                        print(f"    [{status:>4}] {kind} {name}{detail_txt}",
+                              file=sys.stderr, flush=True)
         proc.wait(timeout=args.timeout)
 
         hw_log.seek(0)
@@ -894,6 +1174,12 @@ def main() -> int:
             b.add_argument("--offset", type=int)
             b.add_argument("--max-bytes", type=int, default=1 << 20)
 
+    rep = sub.add_parser("reports")
+    rep.add_argument("--project", required=True)
+    rep.add_argument("--setup")
+    rep.add_argument("--csynth", default="",
+                     help="Vitis HLS C-synthesis report, or a directory holding one")
+
     r = sub.add_parser("run")
     r.add_argument("--project", required=True)
     r.add_argument("--xvc-port", type=int, required=True)
@@ -918,6 +1204,9 @@ def main() -> int:
         result = build_stop(args)
     elif args.cmd == "build-logs":
         result = build_logs(args)
+    elif args.cmd == "reports":
+        result = reports(args.project, getattr(args, "csynth", ""),
+                         getattr(args, "setup", "") or "")
     else:
         result = run(args)
 

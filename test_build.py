@@ -277,6 +277,424 @@ check("elapsed times read sensibly",
       == ("0:07", "1:15", "1:02:05"),
       (cli.fmt_elapsed(7), cli.fmt_elapsed(75), cli.fmt_elapsed(3725)))
 
+print("\nuart metric extraction:")
+# Build a capture without touching a serial port.
+cap = cli.UartCapture.__new__(cli.UartCapture)
+cap.buf = bytearray(
+    b"Function Unaccelerated software ran for 431.250000 ms\n"
+    b"Function Hardware accelerated ran for 88.500000 ms\n"
+    b"SW result: 962122000\nHW result: 962122000\nRESULT: PASS\n")
+check("captures a float from a named group",
+      cap.extract(r"Unaccelerated software ran for ([0-9.]+) ms", 0) == "431.250000")
+check("captures the second measurement independently",
+      cap.extract(r"Hardware accelerated ran for ([0-9.]+) ms", 0) == "88.500000")
+check("returns None when the pattern never appears",
+      cap.extract(r"Nonexistent ([0-9]+)", 0) is None)
+check("a pattern with no group returns the whole match",
+      cap.extract(r"RESULT: PASS", 0) == "RESULT: PASS")
+
+# The buffer is never cleared, so a repeated measurement must resolve to the
+# most recent one rather than a stale line from an earlier boot.
+cap.buf += b"Function Hardware accelerated ran for 12.000000 ms\n"
+check("the last match wins, not the first",
+      cap.extract(r"Hardware accelerated ran for ([0-9.]+) ms", 0) == "12.000000")
+
+print("\nmetric comparisons:")
+m = {"sw_ms": 431.25, "hw_ms": 88.5}
+good, detail = cli.evaluate_comparison(
+    {"metric": "sw_ms", "over": "hw_ms", "min_ratio": 2.0}, m)
+check("a speedup that clears the bar passes", good, detail)
+check("the detail reports the ratio", "4.87x" in detail, detail)
+good, detail = cli.evaluate_comparison(
+    {"metric": "sw_ms", "over": "hw_ms", "min_ratio": 10.0}, m)
+check("a speedup below the bar fails", not good, detail)
+check("the failure says what was wanted", "at least 10.00x" in detail, detail)
+good, detail = cli.evaluate_comparison(
+    {"metric": "sw_ms", "over": "hw_ms", "max_ratio": 2.0}, m)
+check("max_ratio is enforced too", not good, detail)
+good, detail = cli.evaluate_comparison(
+    {"metric": "sw_ms", "over": "typo_ms", "min_ratio": 2.0}, m)
+check("a misspelled metric fails instead of passing vacuously", not good, detail)
+check("...and names the metrics that were captured",
+      "typo_ms" in detail and "hw_ms" in detail, detail)
+good, detail = cli.evaluate_comparison(
+    {"metric": "sw_ms", "over": "zero", "min_ratio": 2.0}, {**m, "zero": 0.0})
+check("dividing by a zero metric fails rather than raising", not good, detail)
+
+print("\npreflight environment checks:")
+ok_, d = cli.evaluate_preflight({"command": "true"}, 0, "")
+check("a command that succeeds passes", ok_, d)
+ok_, d = cli.evaluate_preflight({"command": "test -f /boot/x"}, 1, "")
+check("a command that fails is reported with its status", not ok_ and "exit 1" in d, d)
+ok_, d = cli.evaluate_preflight(
+    {"command": "uname -r", "expect": r"5\.15\.36-xilinx"}, 0, "5.15.36-xilinx-v2022.2")
+check("an expected pattern matches", ok_, d)
+ok_, d = cli.evaluate_preflight(
+    {"command": "uname -r", "expect": r"5\.15\.36-xilinx"}, 0, "6.1.0-generic")
+check("a wrong environment is caught", not ok_ and "does not match" in d, d)
+ok_, d = cli.evaluate_preflight(
+    {"command": "dmesg", "reject": "zocl.*failed"}, 0, "zocl: probe failed")
+check("a forbidden pattern fails", not ok_, d)
+# A pattern found in the output of a command that itself failed proves nothing.
+ok_, d = cli.evaluate_preflight(
+    {"command": "cat /etc/x", "expect": "ok"}, 1, "ok")
+check("a matching pattern from a failed command does not pass", not ok_, d)
+ok_, d = cli.evaluate_preflight(
+    {"command": "grep -q x /f", "exit_code": 1}, 1, "")
+check("a non-zero status can be the expected one", ok_, d)
+
+print("\nimplementation report parsing:")
+_rep = tempfile.mkdtemp()
+_util = os.path.join(_rep, "top_utilization_placed.rpt")
+with open(_util, "w") as fh:
+    fh.write("""
+1. Slice Logic
+--------------
+
++----------------------------+------+-------+------------+-----------+-------+
+|          Site Type         | Used | Fixed | Prohibited | Available | Util% |
++----------------------------+------+-------+------------+-----------+-------+
+| Slice LUTs                 | 8321 |     0 |          0 |     14400 | 57.78 |
+|   LUT as Logic             | 7900 |     0 |          0 |     14400 | 54.86 |
+|   LUT as Memory            |  421 |     0 |          0 |      6000 |  7.02 |
+| Slice Registers            | 9002 |     0 |          0 |     28800 | 31.26 |
++----------------------------+------+-------+------------+-----------+-------+
+
++-------------------+------+-------+------------+-----------+-------+
+|     Site Type     | Used | Fixed | Prohibited | Available | Util% |
++-------------------+------+-------+------------+-----------+-------+
+| Block RAM Tile    |   28 |     0 |          0 |        50 | 56.00 |
+| DSPs              |   40 |     0 |          0 |        66 | 60.61 |
++-------------------+------+-------+------------+-----------+-------+
+""")
+u = ra.parse_utilization(_util)
+check("LUT totals are read", u["lut"] == {"used": 8321, "available": 14400, "pct": 57.78}, u.get("lut"))
+check("an indented sub-row is not mistaken for the total",
+      u["lut"]["used"] == 8321, u.get("lut"))
+check("registers, BRAM and DSP are read",
+      (u["ff"]["used"], u["bram"]["used"], u["dsp"]["used"]) == (9002, 28, 40), u)
+check("percentages survive", u["dsp"]["pct"] == 60.61, u.get("dsp"))
+
+_tim = os.path.join(_rep, "top_timing_summary_routed.rpt")
+with open(_tim, "w") as fh:
+    fh.write("""
+Design Timing Summary
+---------------------
+
+    WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints
+    -------      -------  ---------------------  -------------------
+      1.234        0.000                      0                 9876
+""")
+check("WNS is read from the timing summary",
+      ra.parse_timing(_tim) == {"wns_ns": 1.234}, ra.parse_timing(_tim))
+with open(_tim, "w") as fh:
+    fh.write("    WNS(ns)\n    -------\n     -0.512\n")
+check("a negative WNS is read as negative",
+      ra.parse_timing(_tim) == {"wns_ns": -0.512}, ra.parse_timing(_tim))
+check("a report with no WNS block yields nothing rather than guessing",
+      ra.parse_timing(_util) == {}, ra.parse_timing(_util))
+
+print("\nresource budgets:")
+_r = {"utilization": u, "timing": {"wns_ns": 1.234}}
+res = cli.evaluate_resources({"utilization": {"lut_pct_max": 80}}, _r)
+check("a budget that is met passes", res == [(True, "LUT 57.78% within 80%")], res)
+res = cli.evaluate_resources({"utilization": {"lut_pct_max": 50}}, _r)
+check("a budget that is exceeded fails", not res[0][0], res)
+res = cli.evaluate_resources({"utilization": {"dsp_max": 40}}, _r)
+check("absolute counts are compared, not just percentages", res[0][0], res)
+res = cli.evaluate_resources({"timing": {"wns_min": 0.0}}, _r)
+check("positive slack meets a zero floor", res[0][0], res)
+res = cli.evaluate_resources({"timing": {"wns_min": 0.0}},
+                             {"utilization": u, "timing": {"wns_ns": -0.1}})
+check("negative slack fails the floor", not res[0][0], res)
+res = cli.evaluate_resources({"utilization": {"lut_pct_max": 80}}, {})
+check("a budget with no reports fails instead of passing vacuously",
+      not res[0][0] and "no LUT figure" in res[0][1], res)
+res = cli.evaluate_resources({"utilization": {"nonsense_max": 1}}, _r)
+check("an unknown budget key is rejected", not res[0][0], res)
+res = cli.evaluate_resources({"utilization": {}}, _r)
+check("an empty budget is an error, not a pass", not res[0][0], res)
+
+print("\nlinux console backend:")
+
+
+class FakeBoard:
+    """A Linux console that echoes, answers, and reports an exit status.
+
+    Writes land in the capture buffer synchronously, which is exactly what a
+    real board does asynchronously -- close enough to exercise the protocol.
+    """
+    PROMPT = "root@blkboard:~# "
+
+    def __init__(self, cap, needs_login=False, responses=None):
+        self.cap = cap
+        self.responses = responses or {}
+        self.state = "login" if needs_login else "shell"
+        self.commands = []
+
+    def flush(self):
+        pass
+
+    def _emit(self, s):
+        self.cap.buf += s.encode()
+
+    def write(self, data):
+        line = data.decode()
+        if self.state == "login":
+            if line.strip() == "":
+                self._emit("\r\nblkboard login: ")
+            else:
+                self.state = "password"
+                self._emit(line.strip() + "\r\nPassword: ")
+            return len(data)
+        if self.state == "password":
+            self.state = "shell"
+            self._emit("\r\n" + self.PROMPT)
+            return len(data)
+        cmd = line.strip()
+        if not cmd:
+            self._emit("\r\n" + self.PROMPT)
+            return len(data)
+        self._emit(cmd + "\r\n")                       # terminal echo
+        real = cmd.split("; echo " + cli.LinuxConsole.SENTINEL)[0]
+        self.commands.append(real)
+        rc, out = self.responses.get(real, (0, ""))
+        if out:
+            self._emit(out + "\r\n")
+        self._emit(f"{cli.LinuxConsole.SENTINEL}{rc}\r\n{self.PROMPT}")
+        return len(data)
+
+
+def make_console(needs_login=False, responses=None):
+    cap = cli.UartCapture.__new__(cli.UartCapture)
+    cap.buf = bytearray()
+    cap._ser = FakeBoard(cap, needs_login, responses)
+    con = cli.LinuxConsole(cap, prompt=r"root@[^ ]*# ",
+                           login="root", password="root")
+    return cap, con
+
+
+cap, con = make_console(responses={"echo hello": (0, "hello")})
+con.connect(timeout=5)
+rc, out = con.run("echo hello")
+check("runs a command and captures its output", (rc, out) == (0, "hello"), (rc, out))
+check("the echoed command is not mistaken for output", "echo hello;" not in out, out)
+
+cap, con = make_console(responses={"false": (1, "")})
+con.connect(timeout=5)
+rc, out = con.run("false")
+check("exit status 1 is propagated", rc == 1, rc)
+
+cap, con = make_console(responses={"cat /nope": (1, "No such file or directory")})
+con.connect(timeout=5)
+rc, out = con.run("cat /nope")
+check("stderr-style output is captured with the failing status",
+      rc == 1 and "No such file" in out, (rc, out))
+
+# A board sitting at a login prompt must be driven through it, and the banner
+# must not be answered twice -- searching the whole buffer each time used to
+# re-match the login line forever.
+cap, con = make_console(needs_login=True, responses={"uname -m": (0, "armv7l")})
+con.connect(timeout=5)
+rc, out = con.run("uname -m")
+check("logs in when the board asks", (rc, out) == (0, "armv7l"), (rc, out))
+check("the login name is sent exactly once",
+      cap.text().count("root\r\nPassword:") == 1, cap.text()[:200])
+
+# Multi-line output, and output that itself contains something prompt-shaped.
+cap, con = make_console(responses={"ip addr": (0, "1: lo\r\n2: eth0\r\n    inet 192.168.1.50/24")})
+con.connect(timeout=5)
+rc, out = con.run("ip addr")
+check("multi-line output survives intact",
+      "eth0" in out and "192.168.1.50/24" in out, out)
+
+cap, con = make_console(responses={"tricky": (0, "root@blkboard:~# not a prompt")})
+con.connect(timeout=5)
+rc, out = con.run("tricky")
+check("a prompt-shaped string inside output does not truncate it",
+      "not a prompt" in out and rc == 0, (rc, out))
+
+# No board at all: connect has to give up loudly rather than hang.
+cap = cli.UartCapture.__new__(cli.UartCapture)
+cap.buf = bytearray()
+
+
+class DeadSerial:
+    def write(self, data): return len(data)
+    def flush(self): pass
+
+
+cap._ser = DeadSerial()
+con = cli.LinuxConsole(cap, prompt=r"root@[^ ]*# ")
+t0 = time.time()
+try:
+    con.connect(timeout=2)
+    check("a silent console raises instead of hanging", False, "no error raised")
+except cli.ConsoleError as exc:
+    check("a silent console raises instead of hanging", "no shell prompt" in str(exc), str(exc))
+check("...and gives up near the deadline", time.time() - t0 < 8, time.time() - t0)
+
+print("\nu-boot console:")
+
+
+class FakeUBoot:
+    """Counts down, then offers a prompt once a key arrives."""
+    PROMPT = "Zynq> "
+
+    def __init__(self, cap, keys_needed=3, listing=None):
+        self.cap = cap
+        self.keys = keys_needed
+        self.listing = listing or {}
+        self.at_prompt = False
+
+    def flush(self):
+        pass
+
+    def write(self, data):
+        if not self.at_prompt:
+            self.keys -= 1
+            if self.keys <= 0:
+                self.at_prompt = True
+                self.cap.buf += b"\r\n" + self.PROMPT.encode()
+            else:
+                self.cap.buf += b"\rHit any key to stop autoboot:  2 "
+            return len(data)
+        cmd = data.decode().strip()
+        out = self.listing.get(cmd, "")
+        self.cap.buf += (cmd + "\r\n" + (out + "\r\n" if out else "")
+                         + self.PROMPT).encode()
+        return len(data)
+
+
+_listing = ("            BOOT.BIN\n"
+            "            image.ub\n"
+            "            boot.scr\n"
+            "            binary_container_1.xclbin\n"
+            "            matmul\n"
+            "5 file(s), 0 dir(s)")
+cap = cli.UartCapture.__new__(cli.UartCapture)
+cap.buf = bytearray()
+cap._ser = FakeUBoot(cap, keys_needed=3, listing={"fatls mmc 0:1 /": _listing})
+boot = cli.UBootConsole(cap)
+check("autoboot is interrupted by repeated keys", boot.interrupt(timeout=5))
+out = boot.command("fatls mmc 0:1 /")
+check("the FAT partition is listed", "binary_container_1.xclbin" in out, out)
+check("the echoed command is not part of the listing",
+      not out.startswith("fatls"), out[:40])
+check("the host application is on the card", "matmul" in out, out)
+
+# A board that boots straight through must not look like a u-boot prompt.
+cap2 = cli.UartCapture.__new__(cli.UartCapture)
+cap2.buf = bytearray()
+
+
+class SilentBoot:
+    def write(self, data):
+        cap2.buf += b"\r\nStarting kernel ...\r\n"
+        return len(data)
+
+    def flush(self):
+        pass
+
+
+cap2._ser = SilentBoot()
+check("no false u-boot prompt when the board boots through",
+      not cli.UBootConsole(cap2).interrupt(timeout=2))
+
+print("\nconsole file transfer:")
+import base64 as _b64, hashlib as _hl, re as _re
+
+
+class FakeFsBoard(FakeBoard):
+    """FakeBoard plus just enough shell to receive a base64 transfer."""
+
+    def __init__(self, cap, has_sha=True):
+        super().__init__(cap)
+        self.files = {}
+        self.has_sha = has_sha
+        self.chunks = 0
+
+    def _shell(self, cmd):
+        # shlex.quote leaves shell-safe paths unquoted, so match either form.
+        c = cmd.replace("'", "")
+        if c.startswith("command -v sha256sum"):
+            return (0, "") if self.has_sha else (1, "")
+        if c.startswith("command -v md5sum"):
+            return (0, "")
+        m = _re.match(r"(sha256sum|md5sum) (\S+) 2>/dev/null$", c)
+        if m:
+            data = self.files.get(m.group(2))
+            if data is None:
+                return (1, "")
+            h = (_hl.sha256 if m.group(1) == "sha256sum" else _hl.md5)(data)
+            return (0, f"{h.hexdigest()}  {m.group(2)}")
+        m = _re.match(r"mkdir -p \S+ && : > (\S+)$", c)
+        if m:
+            self.files[m.group(1)] = b""
+            return (0, "")
+        m = _re.match(r"printf %s ([A-Za-z0-9+/=]*) >> (\S+)$", c)
+        if m:
+            self.chunks += 1
+            self.files[m.group(2)] = self.files.get(m.group(2), b"") + m.group(1).encode()
+            return (0, "")
+        m = _re.match(r"base64 -d (\S+) > (\S+) && rm -f \S+$", c)
+        if m:
+            self.files[m.group(2)] = _b64.b64decode(self.files[m.group(1)])
+            del self.files[m.group(1)]
+            return (0, "")
+        return (0, "")
+
+    def write(self, data):
+        line = data.decode().strip()
+        if self.state == "shell" and line:
+            real = line.split("; echo " + cli.LinuxConsole.SENTINEL)[0]
+            rc, out = self._shell(real)
+            self._emit(line.split("\n")[0] + "\r\n")
+            if out:
+                self._emit(out + "\r\n")
+            self._emit(f"{cli.LinuxConsole.SENTINEL}{rc}\r\n{self.PROMPT}")
+            return len(data)
+        return super().write(data)
+
+
+def make_fs_console(has_sha=True):
+    cap = cli.UartCapture.__new__(cli.UartCapture)
+    cap.buf = bytearray()
+    board = FakeFsBoard(cap, has_sha)
+    cap._ser = board
+    con = cli.LinuxConsole(cap, prompt=r"root@[^ ]*# ")
+    con.connect(timeout=5)
+    return board, con
+
+
+_src = os.path.join(tempfile.mkdtemp(), "app.elf")
+_blob = bytes(range(256)) * 40                      # 10 KB, not base64-friendly
+open(_src, "wb").write(_blob)
+
+board, con = make_fs_console()
+check("a file is transferred and verified",
+      con.put_file(_src, "/home/root/app.elf", chunk=1024) == "sent")
+check("the bytes arrive intact", board.files["/home/root/app.elf"] == _blob)
+check("it really was chunked, not one blind write", board.chunks > 1, board.chunks)
+check("the base64 staging file is cleaned up",
+      "/home/root/app.elf.b64" not in board.files, list(board.files))
+check("an unchanged file is not re-sent",
+      con.put_file(_src, "/home/root/app.elf", chunk=1024) == "unchanged")
+
+# Corruption must be caught: the console has no error detection of its own.
+board.files["/home/root/app.elf"] = _blob[:-1] + b"\x00"
+try:
+    con.put_file(_src, "/home/root/app.elf", chunk=1024)
+    board.files["/home/root/app.elf"] = _blob   # transfer repaired it
+    check("a corrupted remote copy is re-sent and ends up correct", True)
+except cli.ConsoleError as exc:
+    check("a corrupted remote copy is re-sent and ends up correct", False, str(exc))
+
+board, con = make_fs_console(has_sha=False)
+check("falls back to md5sum when sha256sum is missing",
+      con.put_file(_src, "/home/root/a.elf", chunk=4096) == "sent"
+      and con.hasher()[0] == "md5sum", con.hasher()[0])
+
 print("\nremote command quoting:")
 import importlib.util as _iu, importlib.machinery as _im
 _s = _iu.spec_from_loader("ftcli0", _im.SourceFileLoader("ftcli0", "./fpgatest"))

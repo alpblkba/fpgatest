@@ -103,6 +103,42 @@ check("stale source listed", m["stale_sources"] == ["src/top.v"], m["stale_sourc
 check("warns about staleness",
       any("newer than the bitstream" in w for w in m["warnings"]), m["warnings"])
 
+print("\nloadhw byproducts must not count as stale sources:")
+# `loadhw` unpacks the XSA into the project directory on every run, so a
+# successful run used to leave 11 files looking newer than the bitstream and
+# made the next run refuse to program.
+root = tempfile.mkdtemp()
+bit, xsa, elf = make_project(root)
+extracted = [
+    "ps7_init.c", "ps7_init.h", "ps7_init.tcl", "ps7_init_gpl.c",
+    "ps7_init_gpl.h", "ps7_init.html",
+    "drivers/dense_axi_v1_0/src/xdense_axi.c",
+    "drivers/dense_axi_v1_0/src/xdense_axi.h",
+    "drivers/dense_axi_v1_0/data/dense_axi.tcl",
+]
+future = time.time() + 600
+for rel in extracted:
+    p = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    open(p, "w").write("/* unpacked from the XSA by loadhw */\n")
+    os.utime(p, (future, future))
+m = ra.discover(root, {})
+check("XSA extraction byproducts are not reported as stale",
+      not m["stale_sources"], m["stale_sources"])
+check("...and no staleness warning is raised",
+      not any("newer than the bitstream" in w for w in m["warnings"]), m["warnings"])
+
+# The exclusion must be narrow: a real source edit still has to be caught.
+real = os.path.join(root, "src", "top.v")
+os.utime(real, (future, future))
+m = ra.discover(root, {})
+check("a genuinely edited source is still caught",
+      m["stale_sources"] == ["src/top.v"], m["stale_sources"])
+
+# Artifact discovery must be unaffected -- the fix is staleness-only.
+check("the bitstream is still discovered with drivers/ present",
+      m["ok"] and m["bit_source"].startswith("xsa:"), m.get("bit_source"))
+
 print("\nXSA exported without -include_bit:")
 root = tempfile.mkdtemp()
 make_project(root, with_bit_in_xsa=False)
@@ -153,6 +189,28 @@ check("post_elf test lands after `dow`",
       tcl.index("dow {") < tcl.index("ft_expect {post check}"))
 check("pre_elf test lands before `dow`",
       tcl.index("ft_expect {multiply 99 x 99}") < tcl.index("dow {"))
+print("\nbanners and notes keep their place in the sequence:")
+# TOML preserves order only within one array, so these live in [[test]] rather
+# than a separate section -- and they are emitted by the agent, not printed by
+# the CLI, because the register tests run remotely and stream back.
+seq = {"base": "0x0", "tests": [
+    {"banner": "Baseline"},
+    {"name": "t1", "ops": [{"write": 0x10, "value": 1}], "note": "HLS: 68 cycles, 8 DSP"},
+    {"banner": "Optimised"},
+    {"name": "t2", "ops": [{"write": 0x10, "value": 2}]},
+]}
+stcl = ra.build_tcl(m, seq, 1)
+check("a banner is emitted", "ft banner {Baseline}" in stcl, )
+check("a note is emitted", "ft note {HLS: 68 cycles, 8 DSP}" in stcl)
+check("the note follows its own test, not the next one",
+      stcl.index("ft testbegin {t1}") < stcl.index("ft note {HLS")
+      < stcl.index("ft banner {Optimised}"))
+check("banners keep their order relative to the tests",
+      stcl.index("ft banner {Baseline}") < stcl.index("ft testbegin {t1}")
+      < stcl.index("ft banner {Optimised}") < stcl.index("ft testbegin {t2}"))
+check("a banner entry needs no ops and asserts nothing",
+      "ft testbegin {Baseline}" not in stcl)
+
 check("uart-only test emits no tcl", "banner" not in tcl)
 
 # Regressions from the first run that got all the way to the board: the PL
@@ -169,6 +227,15 @@ check("the CPU is halted before any register write",
 # `rst -system` cannot survive the XVC round trip: xsdb times out waiting for
 # the DAP to come back and leaves it wedged until the board is power-cycled.
 check("no system reset is issued over XVC", "rst -system" not in tcl)
+# SCTLR.M survives `stop`, so a core that ran anything earlier faults on every
+# physical address -- including ps7_init's own writes. rst -processor clears it
+# without dropping the DAP the way rst -system does.
+check("the core is reset before it is halted",
+      "rst -processor" in tcl and tcl.index("rst -processor") < tcl.index("{stop}"))
+check("the reset comes after the core is selected",
+      tcl.index("select_cpu") < tcl.index("rst -processor"))
+check("a missing rst -processor does not fail the run",
+      "catch {rst -processor}" in tcl)
 # expr cannot concatenate a bareword with a variable; this form always raised
 # `invalid bareword "0x"`, so every register read failed.
 check("register reads do not use the invalid expr 0x-concatenation",
